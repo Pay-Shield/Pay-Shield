@@ -33,3 +33,4 @@ def record_attempt(sender_id: str, recipient_id: str, recipient_status: str) -> 
 def _prune(sender_id: str, now: float) -> None:
     history = _sessions.get(sender_id, [])
     _sessions[sender_id] = [h for h in history if now - h["ts"] <= _SESSION_WINDOW_SECONDS]
+
