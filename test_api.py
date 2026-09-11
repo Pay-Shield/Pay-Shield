@@ -111,4 +111,3 @@ print(f"Latest Hash: {verify_res.get('latest_hash')}")
 print("\n" + "="*60)
 print("All tests completed successfully!")
 print("="*60)
-
