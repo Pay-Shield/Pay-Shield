@@ -129,3 +129,4 @@ Plus 2 bugs found and fixed that weren't on the original list: missing `red_flag
 ## Quick reference: what "done" currently means
 
 Run both servers, open the Payment Simulator, submit any of the 4 presets: real rules + real behavioral/velocity tracking + fallback LLM reasoning run → correct risk score/category/action → for VERIFY/PAUSED, the UI now genuinely stops and waits for your explicit confirm or cancel (with a simulated identity check gating PAUSED) → decision is written to `audit_log.jsonl` as a two-step trail (initial analysis, then resolution) → BLOCKED is a hard stop with no override, verified via a direct attempt to bypass it. That loop is real, tested against the actual running backend, and matches the architecture doc's four required demo scenarios exactly. What's left is mostly "prove it with a real LLM key" and "look at it in an actual browser," not "build more of it."
+
