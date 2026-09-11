@@ -1,4 +1,4 @@
-# PayShield Guardian - Agentic Payment Security
+# PayShield Guardian - Agentic Payment Security 
 
 Intelligent payment security assistant that analyzes payment requests through multiple specialist modules, produces risk scores, and makes secure decisions with human-in-the-loop oversight.
 
