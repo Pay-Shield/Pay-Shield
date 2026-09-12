@@ -1,0 +1,8 @@
+{
+  "name": "PayShield",
+  "description": "AI-powered payment fraud guardian with real-time multi-agent reasoning, cryptographic audit ledger, and zero-trust behavioral defense.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

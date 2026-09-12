@@ -1,240 +1,187 @@
-# PayShield Guardian - Agentic Payment Security 
+# PayShield Guardian — Agentic Payment Security
 
-Intelligent payment security assistant that analyzes payment requests through multiple specialist modules, produces risk scores, and makes secure decisions with human-in-the-loop oversight.
+Intelligent payment security assistant that analyzes payment requests through multiple specialist modules, produces a risk score, and makes secure decisions with human-in-the-loop oversight.
 
-**Stack:** Python/FastAPI backend + React/TypeScript/Vite frontend.
+**Stack:** Single Node.js/TypeScript server (`server.ts`, Express) + React 19/TypeScript/Vite frontend, served from one process on one port.
 
 ## Architecture
 
 **Five Internal Modules (not multi-agent):**
 1. **Recipient Verification** — Is the payee known, new, or flagged?
 2. **Risk Analysis (Rules)** — Amount, keywords, urgency/impersonation language
-3. **Behavioral Pattern** — Velocity checks and user baseline deviation
-4. **LLM Reasoning (Hybrid)** — Nemotron for fast fraud classification; Claude for user-facing explanations (Medium/High risk only)
+3. **Behavioral Pattern** — Velocity checks and per-sender session baseline deviation
+4. **LLM Reasoning** — Local Ollama model (`qwen3:4b-instruct-2507-q4_K_M`) reads the free-text payment note and judges urgency, authority impersonation, threats, and social-engineering pitches
 5. **Decision & Policy** — Aggregates all signals → score → category → action
 
-**Key Principle:** Rules + LLM support the decision; deterministic rules engine is the final authority. No LLM-only decisions.
+**Key principle: rules AND LLM, not rules OR LLM.** `evaluateRisk()` in `server.ts` is the sole authority on `action` and `risk_level` — the LLM is never consulted for, and can never change, that decision. The LLM's only two effects on the response are:
+- A bounded **±15 adjustment** to the numeric `risk_score` (clamped back to 0–100 after applying it)
+- A plain-language **`llm_reasoning`** explanation of what it found (or didn't find) in the note
 
-**Model Stack:**
-- **Fraud Classification:** Nemotron 3.5 Lightning (fast, lightweight) — falls back to keyword heuristics if no API key
-- **Explanations:** Claude Sonnet 5 (high-quality, reserved for Medium/High risk) — falls back to templated text if no API key
-- **Rules engine:** always runs, always the final authority
+If the LLM call fails, times out, or the payment note is empty, the adjustment is simply `0` and `llm_reasoning` is omitted/`null` — the rules-only score and decision still stand. See `guardian-architecture.md` for the full original design spec.
 
-**Categories (internal vocabulary):**
-- **Low (<30)** → Auto-approve
-- **Medium (30–59)** → Require confirmation
-- **High (60–84)** → Require verification + confirmation
-- **Critical (85+)** → Hard block, no override
-
-See `guardian-architecture.md` for the complete original spec.
+**Categories (internal vocabulary, matches the frontend contract):**
+- **SAFE (<30)** → Auto-approve
+- **VERIFY (30–59)** → Require confirmation
+- **PAUSED (60–84)** → Require re-verification + confirmation
+- **BLOCKED (85+)** → Hard block, no override
 
 ## Project Structure
 
 ```
 payshield/
-├── backend/
-│   ├── main.py               # FastAPI app — all HTTP endpoints
-│   ├── pipeline.py           # Shared 5-module risk pipeline (parallel fan-out + aggregate)
-│   ├── models.py             # Pydantic models (internal PS09 shape + frontend contract shape)
-│   ├── modules.py            # Recipient Verification, Risk Rules, Behavioral Pattern
-│   ├── llm_reasoning.py      # Nemotron fraud classification + Claude explanations
-│   ├── aggregator.py         # Score aggregation, category/action mapping, explanation text
-│   ├── frontend_adapter.py   # Translates internal pipeline output -> React frontend's JSON contract
-│   └── audit_log.py          # Persistent JSONL transaction log
-├── frontend/                  # React 19 + TypeScript + Vite + Tailwind UI
-│   ├── src/
-│   │   ├── App.tsx            # Route shell: landing -> auth -> dashboard app
-│   │   ├── services/api.ts    # Calls /api/transactions/analyze & /api/security/scam-check
-│   │   ├── types.ts           # Frontend-side contract types
-│   │   ├── data/mockData.ts   # Seed data for dashboard/transactions/alerts
-│   │   ├── components/        # dashboard, transactions, fraud, security, simulator, landing, auth...
-│   │   └── pages/LandingPage.tsx
-│   ├── package.json
-│   └── vite.config.ts         # Dev proxy: /api -> http://localhost:8000
-├── archived/
-│   ├── static/                # Superseded plain HTML/JS/CSS frontend (kept for reference)
-│   └── payshield.zip          # Original source archive the React frontend was extracted from
-├── requirements.txt            # Python dependencies
-├── .env.example                 # Environment template (Anthropic + Nemotron keys)
-├── test_api.py                   # Backend smoke test (PS09 native endpoints)
-└── guardian-architecture.md       # Full architecture spec
+├── server.ts                  # Express app — every HTTP endpoint, the 5-module risk pipeline,
+│                               # the Ollama LLM reasoning module, and Vite dev-middleware wiring
+├── server/
+│   ├── mongodb.ts              # MongoDB Atlas client for user-added test scenarios
+│   └── razorpay.ts             # Razorpay order creation + payment signature verification (simulated gateway)
+├── src/                        # React 19 + TypeScript + Vite + Tailwind UI
+│   ├── App.tsx                 # Route shell: landing -> auth -> dashboard app
+│   ├── services/api.ts         # Calls /api/transactions/analyze & /api/security/scam-check
+│   ├── types.ts                # Frontend-side response/payload contract types
+│   └── components/             # dashboard, transactions, fraud, security, simulator, landing, guardian...
+├── archived/                   # Superseded static HTML/JS frontend + original source archive (reference only)
+├── data/                       # Local seed/reference data
+├── .env.example                 # Environment template
+├── vite.config.ts               # Vite dev server config (port 3000, @/ alias to src/)
+├── guardian-architecture.md      # Full architecture spec (source of truth for the design)
+└── progress.md                   # What's actually built/verified vs. still open
 ```
 
-## Two API contracts, one pipeline
-
-Both call the exact same five-module `pipeline.run_risk_pipeline()` — only the request/response shape and vocabulary differ.
-
-| | PS09 native (`/api/analyze`) | Frontend contract (`/api/transactions/analyze`) |
-|---|---|---|
-| Payload | `{sender_id, recipient_name, recipient_id, amount, note}` | `{recipientName, upiId, amount, message}` |
-| Risk category | `low / medium / high / critical` | `SAFE / WARNING / HIGH / CRITICAL` |
-| Action | `auto_approve / require_confirmation / require_verification / hard_block` | `SAFE / VERIFY / PAUSED / BLOCKED` |
-| Score detail | `factors: [...]` list | `breakdown: {transactionRisk, recipientRisk, behaviorRisk, socialEngineeringRisk, networkRisk}` (all 0-100) |
-| Used by | `test_api.py`, `archived/static/` | `frontend/` (Payment Simulator modal) |
-
-`frontend_adapter.py` owns this translation. There's also `POST /api/security/scam-check` (frontend-only — analyzes a raw SMS/WhatsApp-style message for scam signals, independent of any payment).
-
-Every call to `/api/transactions/analyze` is written to the audit log immediately (the React frontend has no separate "confirm" round-trip — the simulator shows the result and records the transaction client-side in the same step). The PS09-native flow still has an explicit `/api/confirm` step for Medium/High risk.
+There is no separate backend/frontend split and no Python anywhere in this project — `server.ts` runs Express directly, and in development it mounts Vite as middleware on the same process/port so one `npm run dev` serves both the API and the React app.
 
 ## Setup
 
-### 1. Backend
-
 ```bash
-pip install -r requirements.txt
-cp .env.example .env
-```
-
-Edit `.env`:
-```
-ANTHROPIC_API_KEY=sk-...          # Claude (explanations) — optional, falls back to templates
-NEMOTRON_API_KEY=...              # Nemotron (fraud classification) — optional, falls back to heuristics
-NEMOTRON_API_ENDPOINT=...         # Optional, defaults to NVIDIA API Catalog endpoint
-```
-
-Run it:
-```bash
-python backend/main.py
-```
-Backend serves on `http://localhost:8000`.
-
-### 2. Frontend
-
-```bash
-cd frontend
 npm install
+cp .env.example .env   # edit values as needed — all have safe defaults, see below
 npm run dev
 ```
-Frontend dev server runs on `http://localhost:3000` and proxies all `/api/*` calls to the backend on port 8000 (see `frontend/vite.config.ts`). **Both must be running** for real analysis — otherwise the frontend silently falls back to its own client-side heuristic simulator (`frontend/src/services/api.ts`), which is a decent demo fallback but doesn't touch the Python pipeline, Nemotron, or Claude at all.
 
-### 3. Production-style single-origin run (optional)
+Serves everything — API and React frontend — on `http://localhost:3000`.
+
+### Environment variables (`.env`)
+
+| Variable | Default if unset | Purpose |
+|---|---|---|
+| `MONGODB_URI` | built-in Atlas test cluster URI | Storage for user-added test scenarios (`/api/scenarios`) |
+| `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` | built-in test sandbox keys | Simulated payment gateway order creation/verification |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Where the local Ollama server is running |
+| `OLLAMA_MODEL` | `qwen3:4b-instruct-2507-q4_K_M` | Model used for the LLM reasoning module |
+
+`server.ts` loads `.env` itself via `process.loadEnvFile()` at startup — no `dotenv` package needed. Every one of these has a working fallback default, so the app runs out of the box with no `.env` at all; you only need one if you want your own MongoDB/Razorpay credentials or a different Ollama model.
+
+### Ollama (local LLM reasoning)
 
 ```bash
-cd frontend && npm run build   # outputs frontend/dist
-cd .. && python backend/main.py
+ollama pull qwen3:4b-instruct-2507-q4_K_M
+ollama serve   # if not already running
 ```
-When `frontend/dist/` exists, FastAPI serves the built app directly at `http://localhost:8000/` (no separate frontend server, no proxy needed).
+
+Behavior baked into `callOllamaReasoning()` in `server.ts`:
+- **6-second timeout** (`AbortController`) on every call from the request path — if Ollama doesn't respond in time, the request still completes normally with `llm_reasoning: null` / `llm_score_adjustment: 0` instead of hanging.
+- **`keep_alive: "30m"`** is sent on every call so Ollama keeps the model resident in memory for 30 minutes after each use, instead of unloading it after its short default idle timeout — this avoids paying a multi-second cold-load cost again on the next request during a normal demo/dev session.
+- **Startup warm-up**: when the server starts, it fires one background `callOllamaReasoning()` call (with a longer 30s timeout, since nothing user-facing is waiting on it) so the model is already loaded before the first real transaction arrives. This never blocks server startup and never crashes it if Ollama isn't running yet.
+- If Ollama is unreachable at all, every call fails the same way as a timeout — logged distinctly (`Ollama call failed: ...` vs. `Ollama call timed out after 6s`) so the two cases are easy to tell apart in logs — and the rules-only score/decision is used.
 
 ## API Endpoints
 
-### `POST /api/transactions/analyze` (frontend contract)
+### `POST /api/transactions/analyze`
 ```json
 // Request
-{ "recipientName": "Unknown Recipient", "upiId": "urgent.support@upi", "amount": 25000, "message": "Urgent payment release now or account will be disconnected" }
+{ "recipientName": "Unknown Recipient", "upiId": "urgent.support@upi", "amount": 25000, "message": "Urgent payment release now or account will be disconnected", "senderId": "USER123" }
 
 // Response
 {
-  "risk_score": 82,
-  "risk_level": "HIGH",
-  "action": "PAUSED",
-  "reasons": ["High-urgency language detected...", "..."],
-  "breakdown": { "transactionRisk": 50, "recipientRisk": 45, "behaviorRisk": 9, "socialEngineeringRisk": 68, "networkRisk": 28 },
-  "analysis_duration": 0.83,
-  "transaction_id": "TXN-48213-IN"
+  "risk_score": 92,
+  "risk_level": "CRITICAL",
+  "action": "BLOCKED",
+  "reasons": [
+    "High-urgency language attempting to bypass cognitive verification",
+    "Extortion or intimidation signals (legal, police, or account suspension)",
+    "Institutional authority impersonation pattern detected",
+    "LLM reasoning: This payment note uses strong urgency and threats of account suspension — classic social engineering tactics. It falsely implies institutional authority. There is no legitimate reason to demand immediate payment under threat."
+  ],
+  "breakdown": { "transactionRisk": 90, "recipientRisk": 94, "behaviorRisk": 12, "socialEngineeringRisk": 95, "networkRisk": 14 },
+  "analysis_duration": 0.38,
+  "transaction_id": "TXN-79168-IN",
+  "llm_reasoning": "This payment note uses strong urgency and threats of account suspension — classic social engineering tactics. It falsely implies institutional authority. There is no legitimate reason to demand immediate payment under threat.",
+  "llm_score_adjustment": 15
 }
 ```
+`llm_reasoning` and `llm_score_adjustment` are only present when `message` is non-empty. `action` and `risk_level` always come from the rules engine (`evaluateRisk()`) alone — the LLM adjustment is applied only to `risk_score`, clamped to 0–100.
 
-### `POST /api/security/scam-check` (frontend contract)
+### `POST /api/transactions/confirm`
 ```json
 // Request
-{ "message": "Your electricity will be disconnected tonight, pay immediately via this link" }
-
+{ "transaction_id": "TXN-79168-IN", "confirmed": true }
 // Response
-{ "message": "...", "scamRiskScore": 94, "riskLevel": "CRITICAL", "signalsDetected": {...}, "highlightedKeywords": [...], "explanation": "...", "recommendation": "..." }
+{ "status": "completed", "message": "Payment confirmed and processed successfully.", "transaction_id": "TXN-79168-IN" }
 ```
+Resolves a pending VERIFY/PAUSED decision stored in-memory by `/api/transactions/analyze`. A `BLOCKED` transaction_id always 403s — there is no override path, by design. An already-resolved or unknown `transaction_id` 404s.
 
-### `POST /api/analyze` (PS09 native)
-```json
-// Request
-{ "sender_id": "USER123", "recipient_name": "John Doe", "recipient_id": "JOHN001", "amount": 500.00, "note": "Payment for services" }
-
-// Response
-{ "risk_score": 35, "category": "medium", "action": "require_confirmation", "factors": [...], "llm_reasoning": "...", "confidence": 0.85 }
-```
-
-### `POST /api/confirm` (PS09 native)
-```json
-// Request
-{ "request": {...}, "confirmed": true }
-// Response
-{ "status": "completed", "message": "Payment processed successfully." }
-```
+### `POST /api/security/scam-check`
+Analyzes a raw message (e.g. a suspicious SMS/WhatsApp text) for scam signals, independent of any payment. `{ message }` in, `{ scamRiskScore, riskLevel, signalsDetected, highlightedKeywords, explanation, recommendation }` out.
 
 ### `GET /api/audit-history?limit=50`
-Returns the persisted transaction log (both contracts write to the same `audit_log.jsonl`).
+Returns the most recent entries from the in-memory legacy audit log (human-readable transaction summaries).
+
+### `GET /api/audit/chain?limit=50` and `GET /api/audit/verify`
+The SHA-256 hash-chained audit trail (`CryptoAuditTrail` in `server.ts`) — every module decision, LLM call outcome, and confirm/cancel resolution is recorded as a linked, tamper-evident entry. `/api/audit/verify` recomputes every hash and previous-hash pointer and reports whether the chain is intact. **Note:** this trail is in-memory only and resets on server restart — it is not currently persisted to disk (there is a stale `audit_chain.jsonl` file in the repo root from an earlier iteration of this project; the current `server.ts` does not write to it).
+
+### `GET /api/health`
+Simple liveness check: `{ status: "ok", time: "<ISO timestamp>" }`.
+
+### MongoDB-backed test scenarios: `GET/POST /api/scenarios`, `DELETE /api/scenarios/:id`, `GET /api/scenarios/status`
+User-addable custom test scenarios, persisted to MongoDB Atlas (falls back to an in-memory, non-persistent cache if Atlas is genuinely unreachable). `mongodb+srv://` URIs need a DNS SRV lookup to connect at all — on a machine where Node's own DNS resolver can't reach a working DNS server (some VPN/security software points it at an unreachable local address even though the OS resolver works fine for everything else), `server/mongodb.ts` detects the DNS-shaped failure and automatically retries once against public DNS servers (`8.8.8.8`, `1.1.1.1`) before falling back to the in-memory cache.
+
+### Simulated Razorpay gateway: `GET /api/razorpay/config`, `POST /api/create-order` (alias `/api/razorpay/create-order`), `POST /api/verify-payment` (alias `/api/razorpay/verify-payment`)
+Order creation and HMAC signature verification against the Razorpay test sandbox — no real money moves.
 
 ## Demo Scenarios
 
-The React Payment Simulator ships with these presets (Quick Scenario Presets in the modal):
+The React Payment Simulator ships with presets that map onto the four brief-required cases from `guardian-architecture.md` §8:
 
-1. **Trusted Friend** — known-style recipient, ₹1,200, "Lunch contribution" → expect **SAFE**
-2. **New Freelancer** — new recipient, ₹8,500, plain note → expect **VERIFY**
-3. **Utility Threat Scam** — urgency + impersonation language, ₹25,000 → expect **PAUSED**
-4. **Crypto Syndicate Scam** — gift-card/crypto + guaranteed-return language, ₹50,000 → expect **BLOCKED**
-
-These map onto the four brief-required cases from `guardian-architecture.md` §8 (Low/Medium/High/Critical).
+1. **Trusted Friend / known merchant** — known-style recipient, typical amount, plain note → expect **SAFE**
+2. **New Freelancer** — new recipient, typical amount, plain note → expect **VERIFY**
+3. **Utility Threat Scam** — new/flagged recipient, elevated amount, urgency + impersonation language → expect **PAUSED**
+4. **Crypto Syndicate Scam** — flagged recipient, amount far above baseline, urgency + impersonation + crypto/gift-card language → expect **BLOCKED**
 
 ## Testing
 
-### Backend only
-```bash
-pip install requests
-python test_api.py
-```
-Exercises `/api/analyze`, `/api/confirm`, `/api/audit-history` directly and prints results.
+1. `npm run dev`
+2. Open `http://localhost:3000`
+3. Launch the app → open the **Payment Simulator** from the sidebar
+4. Try each preset, or enter a custom recipient/amount/message, and click **Analyze Payment**
+5. For VERIFY/PAUSED results, resolve the human-in-the-loop confirm/cancel step (PAUSED additionally requires a simulated identity re-check first)
+6. Check the **Transactions** and **Fraud & Alerts** tabs, and `GET /api/audit-history` / `GET /api/audit/chain`, to see the result recorded
 
-### Full stack
-1. Terminal 1: `python backend/main.py`
-2. Terminal 2: `cd frontend && npm run dev`
-3. Open `http://localhost:3000`
-4. Click **Launch App** (or sign up) → open the **Payment Simulator** from the sidebar
-5. Try each preset, or enter a custom recipient/amount/message, and click **Analyze Payment**
-6. Watch the backend terminal — it logs each module's contribution live:
-   ```
-   📊 Analyzing payment: Electricity Billing Cell for $25000
-     ✓ Recipient: new
-     ✓ Rules: 15
-     ✓ Behavioral: 0
-     🤖 Calling LLM for fraud classification...
-       🔍 Attempting Nemotron API call...
-       ⚠ Nemotron unavailable, falling back to heuristics
-       ✓ Using heuristics: ['urgency_pressure', 'impersonation_attempt']
-     ✓ LLM Model: heuristic_fallback
-     ✓ LLM Adjustment: 15
-     📈 Final Score: 55
-     🎯 Category: medium
-     ⚡ Action: require_confirmation
-   ```
-7. Check **Transactions** and **Fraud & Alerts** tabs to see the result recorded
-8. Confirm persistence: `GET http://localhost:8000/api/audit-history` should show the entry
-
-**Note:** if you see the browser network tab requesting `/api/transactions/analyze` and getting nothing back (or a connection-refused in the console), the backend isn't running — the UI will look identical because of the client-side fallback simulator, but you're not exercising the real pipeline. Always check the backend terminal logs to confirm real analysis ran.
+`npm run lint` runs `tsc --noEmit` for a full type-check.
 
 ## Architecture Philosophy
 
-- **Single agent, modular internals** — avoids orchestration overhead
-- **Deterministic rules + LLM support** — Rules are the final authority. LLM provides fraud classification (fast) + explanations (high-quality)
-- **Intelligent LLM usage** — Nemotron (lightweight) for routine fraud detection; Claude (expensive) reserved for user-facing explanations and edge cases
-- **Parallel execution** — independent modules run concurrently
-- **Human-in-the-loop by design** — medium/high risk require explicit user confirmation
-- **Simulated payments** — no real gateway integration
-- **Persistent audit log** — JSONL format for transparency
-- **One pipeline, two contracts** — the frontend's polished UI and the PS09 spec's native vocabulary both run through the identical risk engine; only the translation layer (`frontend_adapter.py`) differs
+- **Single agent, modular internals** — avoids multi-agent orchestration overhead
+- **Rules are the final authority; the LLM only ever nudges within ±15** — no LLM-only decisions, ever
+- **Bounded, explainable LLM usage** — one local model call per non-empty payment note, timeout-safe, never on the critical path for the block/allow decision itself
+- **Parallel-friendly module design** — recipient verification, rule scoring, and behavioral pattern checks don't depend on each other's output
+- **Human-in-the-loop by design** — VERIFY/PAUSED require explicit user confirmation; BLOCKED has no override
+- **Simulated payments** — Razorpay integration runs against the test sandbox only; no real gateway integration
+- **Cryptographically verifiable audit trail** — SHA-256 hash chain over every decision, in-memory per process
 
 ```
 Payment Request
       ↓
-Rule Engine (deterministic)
+Rule Engine (deterministic) ──────────────┐
+      ↓                                    │
+Local LLM (Ollama) reads the note          │  (runs only if message is non-empty;
+      ↓                                    │   failure/timeout → adjustment = 0)
+±15 bounded score adjustment + narrative ──┘
       ↓
-Nemotron (fast fraud classification)
-      ↓
-Risk Score (rule-based with LLM input)
-  ┌───┼────┐
- LOW MEDIUM HIGH/CRITICAL
- ↓     ↓     ↓
-Allow  Review Claude explanation
-             ↓
-        User sees reasoning
+Final risk_score, but action/risk_level are the rule engine's alone
+  ┌────┼─────┬──────────┐
+SAFE VERIFY PAUSED   BLOCKED
+      ↓        ↓          ↓
+  confirm   confirm    hard stop,
+  required  + re-verify no override
 ```
 
 No single LLM decides financial transactions alone.
